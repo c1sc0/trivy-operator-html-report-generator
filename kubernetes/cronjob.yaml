@@ -1,0 +1,186 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: trivy-html-reporter
+  namespace: trivy-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: trivy-report-reader
+rules:
+- apiGroups: ["aquasecurity.github.io"]
+  resources: ["vulnerabilityreports"]
+  verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: trivy-report-reader-binding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: trivy-report-reader
+subjects:
+- kind: ServiceAccount
+  name: trivy-html-reporter
+  namespace: trivy-system
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: trivy-html-report-generator
+  namespace: trivy-system
+spec:
+  # Run every hour
+  schedule: "0 * * * *"
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          serviceAccountName: trivy-html-reporter
+          restartPolicy: Never
+          containers:
+          - name: reporter
+            image: alpine:latest
+            command:
+            - /bin/sh
+            - -c
+            - |
+              set -e
+              
+              # Install dependencies
+              apk add --no-cache bash curl jq kubectl
+              
+              # Copy scripts
+              cp /scripts/trivy-report-to-html.sh /tmp/
+              cp /scripts/generate-html.sh /tmp/
+              chmod +x /tmp/*.sh
+              
+              # Clean up old reports
+              echo "Cleaning up old reports..."
+              rm -rf /reports/*.html
+              
+              # Generate reports for all namespaces
+              /tmp/trivy-report-to-html.sh --list
+              
+              # Loop through all reports and generate HTML
+              kubectl get vulnerabilityreports --all-namespaces -o json | \
+                jq -r '.items[] | "\(.metadata.namespace) \(.metadata.name)"' | \
+                while read namespace name; do
+                  echo "Processing $namespace/$name"
+                  /tmp/trivy-report-to-html.sh --namespace "$namespace" --report "$name" --output "/reports/${namespace}_${name}.html" || true
+                done
+              
+              echo "Report generation completed"
+            volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+            - name: reports
+              mountPath: /reports
+          volumes:
+          - name: scripts
+            configMap:
+              name: trivy-html-generator
+          - name: reports
+            persistentVolumeClaim:
+              claimName: trivy-reports-pvc
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: trivy-reports-pvc
+  namespace: trivy-system
+spec:
+  accessModes:
+  - ReadWriteMany
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nginx-config
+  namespace: trivy-system
+data:
+  default.conf: |
+    server {
+        listen 80;
+        server_name _;
+        
+        location / {
+            root /usr/share/nginx/html;
+            autoindex on;
+            autoindex_exact_size off;
+            autoindex_localtime on;
+        }
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: trivy-reports-nginx
+  namespace: trivy-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: trivy-reports-nginx
+  template:
+    metadata:
+      labels:
+        app: trivy-reports-nginx
+    spec:
+      containers:
+      - name: nginx
+        image: nginx:alpine
+        ports:
+        - containerPort: 80
+        volumeMounts:
+        - name: reports
+          mountPath: /usr/share/nginx/html
+        - name: nginx-config
+          mountPath: /etc/nginx/conf.d/default.conf
+          subPath: default.conf
+      volumes:
+      - name: reports
+        persistentVolumeClaim:
+          claimName: trivy-reports-pvc
+      - name: nginx-config
+        configMap:
+          name: nginx-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: trivy-reports-web
+  namespace: trivy-system
+spec:
+  selector:
+    app: trivy-reports-nginx
+  ports:
+  - port: 80
+    targetPort: 80
+  type: ClusterIP
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: trivy-reports-ingress
+  namespace: trivy-system
+spec:
+  ingressClassName: traefik-internal
+  rules:
+  - host: trivy-reports.example.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: trivy-reports-web
+            port:
+              number: 80

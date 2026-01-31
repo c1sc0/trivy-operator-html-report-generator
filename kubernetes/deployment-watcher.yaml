@@ -1,0 +1,185 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: trivy-system
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: trivy-scripts
+  namespace: trivy-system
+data:
+  watch.sh: |
+    #!/bin/bash
+    set -e
+    
+    OUTPUT_DIR="/reports"
+    mkdir -p "$OUTPUT_DIR"
+    
+    echo "Starting real-time VulnerabilityReport watcher..."
+    
+    # Watch for changes using kubectl
+    kubectl get vulnerabilityreports --all-namespaces --watch -o json | \
+    while read -r event; do
+      TYPE=$(echo "$event" | jq -r '.type')
+      NAMESPACE=$(echo "$event" | jq -r '.object.metadata.namespace')
+      NAME=$(echo "$event" | jq -r '.object.metadata.name')
+      
+      if [ "$TYPE" = "ADDED" ] || [ "$TYPE" = "MODIFIED" ]; then
+        echo "[$(date)] Detected $TYPE: $NAMESPACE/$NAME"
+        /scripts/trivy-report-to-html.sh --namespace "$NAMESPACE" --report "$NAME" --output "$OUTPUT_DIR/${NAMESPACE}_${NAME}.html" || true
+      fi
+    done
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: trivy-watcher
+  namespace: trivy-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: vulnerability-report-watcher
+rules:
+- apiGroups: ["aquasecurity.github.io"]
+  resources: ["vulnerabilityreports"]
+  verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: trivy-watcher-binding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: vulnerability-report-watcher
+subjects:
+- kind: ServiceAccount
+  name: trivy-watcher
+  namespace: trivy-system
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: trivy-report-watcher
+  namespace: trivy-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: trivy-report-watcher
+  template:
+    metadata:
+      labels:
+        app: trivy-report-watcher
+    spec:
+      serviceAccountName: trivy-watcher
+      initContainers:
+      - name: install-kubectl
+        image: alpine:latest
+        command:
+        - /bin/sh
+        - -c
+        - |
+          apk add --no-cache kubectl
+          cp /usr/bin/kubectl /kubectl-bin/
+        volumeMounts:
+        - name: kubectl-bin
+          mountPath: /kubectl-bin
+      containers:
+      - name: watcher
+        image: alpine:latest
+        command: ["/bin/sh", "/config/watch.sh"]
+        env:
+        - name: PATH
+          value: "/kubectl-bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+        volumeMounts:
+        - name: config
+          mountPath: /config
+        - name: scripts
+          mountPath: /scripts
+        - name: reports
+          mountPath: /reports
+        - name: kubectl-bin
+          mountPath: /kubectl-bin
+      volumes:
+      - name: config
+        configMap:
+          name: trivy-scripts
+          defaultMode: 0755
+      - name: scripts
+        configMap:
+          name: trivy-html-generator
+          defaultMode: 0755
+      - name: kubectl-bin
+        emptyDir: {}
+      - name: reports
+        persistentVolumeClaim:
+          claimName: trivy-reports-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: trivy-reports-web
+  namespace: trivy-system
+spec:
+  selector:
+    app: trivy-reports-nginx
+  ports:
+  - port: 80
+    targetPort: 80
+  type: LoadBalancer
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: trivy-reports-nginx
+  namespace: trivy-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: trivy-reports-nginx
+  template:
+    metadata:
+      labels:
+        app: trivy-reports-nginx
+    spec:
+      containers:
+      - name: nginx
+        image: nginx:alpine
+        ports:
+        - containerPort: 80
+        volumeMounts:
+        - name: reports
+          mountPath: /usr/share/nginx/html
+        - name: nginx-config
+          mountPath: /etc/nginx/conf.d/default.conf
+          subPath: default.conf
+      volumes:
+      - name: reports
+        persistentVolumeClaim:
+          claimName: trivy-reports-pvc
+      - name: nginx-config
+        configMap:
+          name: nginx-config
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nginx-config
+  namespace: trivy-system
+data:
+  default.conf: |
+    server {
+        listen 80;
+        server_name _;
+        
+        location / {
+            root /usr/share/nginx/html;
+            autoindex on;
+            autoindex_exact_size off;
+            autoindex_localtime on;
+        }
+    }
